@@ -592,7 +592,8 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(self,
+                skip_prefixes=["apm", "tts", "audio_projection_layer"])
         return loader.load_weights(weights)
 
     def get_mm_mapping(self) -> MultiModelKeys:
