@@ -392,7 +392,7 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
             if model_type == "phi3_v":
                 # Workaround since this token is not defined in the tokenizer
                 return f"<|image_{current_count}|>"
-            if model_type == "minicpmv":
+            if model_type in ("minicpmv", "minicpmo"):
                 return "(<image>./</image>)"
             if model_type in ("blip-2", "chatglm", "fuyu", "paligemma",
                               "pixtral"):
