@@ -265,6 +265,7 @@ async def handle_chat_completions(request: Request):
 
 
 @app.get("/healthcheck")
+@app.get("/health")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
     return {

@@ -180,6 +180,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "LocalConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.local_connector",
+    "LocalConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",

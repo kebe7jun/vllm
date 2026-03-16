@@ -57,6 +57,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from .pred import SchedulerPredictor, StepFeatures, StepObservation
+
 logger = init_logger(__name__)
 
 
@@ -263,6 +265,11 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self.predictor = SchedulerPredictor(
+            window_size=1024,
+            decode_only=False,
+            step_time_target_ms=40.0,
+        )
 
     def _mamba_block_aligned_split(
         self,
@@ -349,6 +356,8 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        features: StepFeatures = StepFeatures.new()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -425,6 +434,28 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
+            is_prefill = num_new_tokens > 1
+            if not self.predictor.can_admit(
+                features,
+                request.num_computed_tokens,
+                num_new_tokens if is_prefill else 0,
+                is_prefill=is_prefill,
+            ).allow:
+                # The predictor may reject the admission of this request based on
+                # the current step features and the candidate new tokens. In this
+                # case, we skip scheduling this request in the current step, and
+                # try scheduling the next request. This allows the predictor to
+                # control the pacing of each request based on the overall step
+                # features, rather than just admitting as many requests as possible
+                # according to the FCFS policy.
+                req_index += 1
+                continue
+            if is_prefill:
+                features.add_prefill_request(
+                    request.num_computed_tokens, num_new_tokens
+                )
+            else:
+                features.add_decode_request(request.num_computed_tokens)
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -528,6 +559,11 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        if features.has_decode():
+            token_budget = self.predictor.max_prefill_tokens_allowed(
+                features, 0, token_budget
+            )
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -786,6 +822,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                features.add_prefill_request(num_computed_tokens, num_new_tokens)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -907,6 +944,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_features=features,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1289,6 +1327,14 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        if scheduler_output.step_features:
+            self.predictor.update(
+                StepObservation(
+                    features=scheduler_output.step_features,
+                    step_time_ms=(time.time() - scheduler_output.step_features.ts)
+                    * 1000,
+                )
+            )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1782,9 +1828,9 @@ class Scheduler(SchedulerInterface):
         return kv_xfer_params
 
     def _free_blocks(self, request: Request):
-        assert request.is_finished()
-        self.kv_cache_manager.free(request)
-        del self.requests[request.request_id]
+        if request.is_finished():
+            self.kv_cache_manager.free(request)
+            del self.requests[request.request_id]
 
     @property
     def pause_state(self) -> PauseState:
