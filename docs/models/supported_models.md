@@ -578,7 +578,7 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
 | `KeyeVL1_5ForConditionalGeneration` | Keye-VL-1_5-8B | T + I<sup>E+</sup> + V<sup>E+</sup> | `Kwai-Keye/Keye-VL-1_5-8B` | ✅︎ | ✅︎ |
 | `KimiAudioForConditionalGeneration` | Kimi-Audio | T + A<sup>+</sup> | `moonshotai/Kimi-Audio-7B-Instruct` | | ✅︎ |
 | `KimiK25ForConditionalGeneration` | Kimi-K2.5 | T + I<sup>+</sup> | `moonshotai/Kimi-K2.5` | | ✅︎ |
-| `KimiK3ForConditionalGeneration` | Kimi-K3 | T + I<sup>+</sup> | `moonshotai/Kimi-K3` | | ✅︎ |
+| `KimiK3ForConditionalGeneration` | Kimi-K3 | T + I<sup>+</sup> + V<sup>+</sup> | `moonshotai/Kimi-K3` | | ✅︎ |
 | `KimiVLForConditionalGeneration` | Kimi-VL-A3B-Instruct, Kimi-VL-A3B-Thinking | T + I<sup>+</sup> | `moonshotai/Kimi-VL-A3B-Instruct`, `moonshotai/Kimi-VL-A3B-Thinking` | | ✅︎ |
 | `LightOnOCRForConditionalGeneration` | LightOnOCR-1B | T + I<sup>+</sup> | `lightonai/LightOnOCR-1B`, etc | ✅︎ | ✅︎ |
 | `Lfm2VlForConditionalGeneration` | LFM2-VL | T + I<sup>+</sup> | `LiquidAI/LFM2-VL-450M`, `LiquidAI/LFM2-VL-3B`, `LiquidAI/LFM2-VL-8B-A1B`, etc. | ✅︎ | ✅︎ |
@@ -682,6 +682,17 @@ Some models are supported only via the [Transformers modeling backend](#transfor
 
 !!! note
     For `InternVLChatModel`, only InternVL2.5 with Qwen2.5 text backbone (`OpenGVLab/InternVL2.5-1B` etc.), InternVL3 and InternVL3.5 have video inputs support currently.
+
+!!! note
+    For `KimiK3ForConditionalGeneration`, video input is enabled only when the
+    checkpoint's media processor declares video preprocessing (keys such as
+    `sample_fps` or `temporal_merge_kernel_size` in its `media_proc_cfg`); on a
+    checkpoint without them the model stays image-only. Frames are sampled to
+    `sample_fps`, grouped into temporal chunks of `temporal_merge_kernel_size`
+    frames, and each chunk is prefixed with its timestamp in the prompt.
+    Because MoonViT-3D pools across the temporal axis, a chunk of `k` frames
+    costs the same number of tokens as a single frame. Video items are encoded
+    eagerly: the encoder CUDA graph covers images only.
 
 !!! note
     To use `allenai/MolmoWeb-4B` or `allenai/MolmoWeb-8B`, serve the checkpoint

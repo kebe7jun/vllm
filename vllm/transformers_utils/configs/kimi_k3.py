@@ -94,6 +94,9 @@ class KimiK3Config(PretrainedConfig):
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         image_placeholder: str = "<|kimi_image_placeholder|>",
+        video_placeholder: str = (
+            "<|media_begin|>video<|media_content|><|media_pad|><|media_end|>"
+        ),
         **kwargs,
     ):
         if text_config is None:
@@ -124,6 +127,16 @@ class KimiK3Config(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
+        # Prompt-level marker for one source video, matched as a token
+        # *sequence* by the multi-modal processor and replaced with the
+        # video's timestamped ``<|media_begin|>video ...`` blocks (one per
+        # temporal chunk). Built only from media structure tokens the
+        # checkpoint provably has -- the same shape Kimi-K2.5 uses for its
+        # image placeholder -- so it never depends on a marker token that
+        # may be missing from the vocabulary. It cannot collide with an
+        # expanded image block, which carries ``image {w}x{h}`` instead of
+        # ``video`` after ``<|media_begin|>``.
+        self.video_placeholder = video_placeholder
 
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config

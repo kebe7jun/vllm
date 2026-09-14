@@ -99,6 +99,10 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MLP,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.common.video_inputs import (
+    group_chunk_features,
+    normalize_video_pixel_inputs,
+)
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -1786,6 +1790,11 @@ class KimiK3ForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return "<|kimi_image_placeholder|>"
+        if modality == "video":
+            # Expanded into one timestamped `<|media_begin|>video ...`
+            # block per temporal chunk by `_get_prompt_updates`. Keep in
+            # sync with `KimiK3Config.video_placeholder`.
+            return "<|media_begin|>video<|media_content|><|media_pad|><|media_end|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(
@@ -2128,7 +2137,45 @@ class KimiK3ForConditionalGeneration(
         )
         return media_features
 
+    def _parse_and_validate_video_input(
+        self, **kwargs: object
+    ) -> tuple[KimiK25MediaPixelInputs, list[int]] | None:
+        pixel_values = kwargs.pop("pixel_values_videos", None)
+        if pixel_values is None:
+            return None
+
+        pixel_values, grid_thws, chunk_counts = normalize_video_pixel_inputs(
+            pixel_values,
+            kwargs.pop("video_grid_thws", None),
+            kwargs.pop("num_chunks_per_video", None),
+            next(self.vision_tower.parameters()).dtype,
+        )
+        return (
+            KimiK25MediaPixelInputs(
+                type="pixel_values",
+                pixel_values=pixel_values,
+                grid_thws=grid_thws,
+            ),
+            chunk_counts,
+        )
+
+    def _process_video_input(
+        self,
+        media_input: KimiK25MediaPixelInputs,
+        chunk_counts: list[int],
+    ) -> list[torch.Tensor]:
+        # One feature tensor per temporal chunk; stitch each video's chunks
+        # back together so the batch holds exactly one tensor per item.
+        chunk_features = self._process_media_input(media_input)
+        return group_chunk_features(chunk_features, chunk_counts)
+
     def embed_multimodal(self, **kwargs: object) -> NestedTensors | None:
+        # The runner batches one modality at a time, so at most one of these
+        # branches has data in any given call.
+        video_input = self._parse_and_validate_video_input(**kwargs)
+        if video_input is not None:
+            return self._process_video_input(*video_input)
+
         media_input = self._parse_and_validate_media_input(**kwargs)
         if media_input is None:
             return None
