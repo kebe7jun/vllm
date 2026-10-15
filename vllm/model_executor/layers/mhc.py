@@ -797,6 +797,9 @@ class MHCFusedPostPreOp(CustomOp):
         tile_n: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        peer_x: torch.Tensor | None = None,
+        seq: torch.Tensor | None = None,
+        world: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
@@ -815,6 +818,9 @@ class MHCFusedPostPreOp(CustomOp):
             tile_n,
             norm_weight,
             norm_eps,
+            peer_x,
+            seq,
+            world,
         )
 
     def forward_hip(

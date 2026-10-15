@@ -827,6 +827,15 @@ def get_model_params(config):
         intermediate_size = config.moe_intermediate_size
         hidden_size = config.hidden_size
     elif architecture in (
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+    ):
+        text_config = config.get_text_config()
+        E = text_config.n_routed_experts
+        topk = text_config.num_experts_per_tok
+        intermediate_size = text_config.moe_intermediate_size
+        hidden_size = text_config.hidden_size
+    elif architecture in (
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeTextConfig",

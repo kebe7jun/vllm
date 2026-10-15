@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
@@ -18,11 +19,20 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
     can_use_dsv4_topk,
     dsv4_topk,
 )
+from vllm.model_executor.layers.fused_moe.router.small_m_topk_sigmoid import (
+    MAX_TOKENS as SMALL_M_TOPK_MAX_TOKENS,
+)
+from vllm.model_executor.layers.fused_moe.router.small_m_topk_sigmoid import (
+    small_m_topk_sigmoid,
+)
 
 # AITER instantiates biased_grouped_topk only for these NUM_GRP values, with at
 # most this many experts per group.
 AITER_SUPPORTED_NUM_GRP = (1, 2, 4, 8)
 AITER_MAX_EXPERTS_PER_GROUP = 32
+
+
+logger = init_logger(__name__)
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -430,6 +440,29 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
+        if (
+            self.scoring_func == "sigmoid"
+            and self.e_score_correction_bias is not None
+            and self._hash_indices_table is None
+            and self.bias_vl is None
+            and router_logits.shape[0] <= SMALL_M_TOPK_MAX_TOKENS
+            and router_logits.is_cuda
+            and indices_type in (None, torch.int32, torch.int64, torch.uint32)
+            and not rocm_aiter_ops.is_fused_moe_enabled()
+        ):
+            # one launch for sigmoid, bias, top-k, renorm and the fused
+            # shared-expert slots (the CUDA top-k plus two cats otherwise)
+            logger.info_once("Using small-M fused sigmoid top-k routing kernel")
+            return small_m_topk_sigmoid(
+                router_logits,
+                self.e_score_correction_bias.data,
+                self.top_k,
+                self.renormalize,
+                self.routed_scaling_factor,
+                self.num_fused_shared_experts,
+                self.shared_expert_weight,
+                indices_type,
+            )
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,

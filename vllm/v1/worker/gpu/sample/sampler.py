@@ -83,6 +83,9 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Same, but ignoring top-k/top-p: when the fused sampler applies those
+        # itself, a request with only top-k/top-p needs no logits pass at all.
+        self.needs_logits_processing_wo_topkp = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,16 +98,37 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
-            req_idx, sampling_params
-        )
+        needs_other = self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            needs_other |= processor.add_request(req_idx, sampling_params)
+        self.needs_logits_processing[req_idx] = needs_processing | needs_other
+        temperature = sampling_params.temperature
+        self.needs_logits_processing_wo_topkp[req_idx] = needs_other | (
+            temperature != 0.0 and (temperature != 1.0 or sampling_params.min_p != 0.0)
+        )
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
+
+    def _needs_pos_and_input_ids(self, idx_mapping_np: np.ndarray) -> bool:
+        """False only when the step is guaranteed to run the fused sampler with no
+        logits processing, i.e. positions / input ids are never read."""
+        if not (self.use_flashinfer or self.use_xpu_sampler):
+            return True
+        if np.any(self.needs_logits_processing_wo_topkp[idx_mapping_np]):
+            return True
+        states = self.sampling_states
+        if (
+            not states.any_top_k_top_p(idx_mapping_np)
+            or states.any_greedy(idx_mapping_np)
+            or states.any_explicit_seed(idx_mapping_np)
+        ):
+            return True
+        return (
+            self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            and self.get_logprobs_dims(idx_mapping_np) is not None
+        )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -141,8 +165,13 @@ class Sampler:
         idx_mapping_np = input_batch.idx_mapping_np
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
-        pos = input_batch.positions[input_batch.logits_indices]
-        input_ids = input_batch.input_ids[input_batch.logits_indices]
+        if self._needs_pos_and_input_ids(idx_mapping_np):
+            pos = input_batch.positions[input_batch.logits_indices]
+            input_ids = input_batch.input_ids[input_batch.logits_indices]
+        else:
+            # top-k/top-p-only requests on the fused sampler: neither the
+            # logits processors nor Gumbel sampling run, so skip the gathers
+            pos = input_ids = None
         seq_lens_upper_bound_np = input_batch.seq_lens_cpu_upper_bound.numpy()
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
@@ -234,8 +263,17 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         skip_top_k_top_p: bool = False,
+        skip_if_only_top_k_top_p: bool = False,
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
+            return logits
+        if (
+            skip_top_k_top_p
+            and skip_if_only_top_k_top_p
+            and not np.any(self.needs_logits_processing_wo_topkp[idx_mapping_np])
+        ):
+            # Only top-k/top-p, which the caller applies without touching
+            # ``logits``: no copy, no processor pass.
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -287,6 +325,18 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Don't use a fused sampler if no requests use top_k/top_p, if there are
+        # any greedy requests or per-request seeds, or if post-processed
+        # logprobs need to be returned for any requests.
+        fused_sampler_eligible = not (
+            not self.sampling_states.any_top_k_top_p(idx_mapping_np)
+            or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            or self.sampling_states.any_greedy(idx_mapping_np)
+            or self.sampling_states.any_explicit_seed(idx_mapping_np)
+        )
+        use_fused_sampler = (
+            self.use_flashinfer or self.use_xpu_sampler
+        ) and fused_sampler_eligible
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -297,22 +347,15 @@ class Sampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
             skip_top_k_top_p=True,
+            skip_if_only_top_k_top_p=use_fused_sampler,
         )
+        # The FlashInfer kernels take a scalar when every request shares the
+        # same top-k / top-p, which saves the per-request gathers.
         top_k, top_p = self.sampling_states.get_top_k_top_p(
-            expanded_idx_mapping, idx_mapping_np
+            expanded_idx_mapping,
+            idx_mapping_np,
+            scalar_ok=use_fused_sampler and self.use_flashinfer,
         )
-        # Don't use a fused sampler if no requests use top_k/top_p, if there are
-        # any greedy requests or per-request seeds, or if post-processed
-        # logprobs need to be returned for any requests.
-        fused_sampler_eligible = not (
-            (top_k is None and top_p is None)
-            or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
-            or self.sampling_states.any_greedy(idx_mapping_np)
-            or self.sampling_states.any_explicit_seed(idx_mapping_np)
-        )
-        use_fused_sampler = (
-            self.use_flashinfer or self.use_xpu_sampler
-        ) and fused_sampler_eligible
 
         return self._sample_random(
             processed_logits,

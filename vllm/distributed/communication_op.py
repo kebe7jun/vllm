@@ -6,11 +6,21 @@ from typing import Any
 import torch
 import torch.distributed
 
+from vllm.distributed.device_communicators.mhc_fused_allreduce import (
+    get_mhc_fused_allreduce,
+)
+
 from .parallel_state import get_tp_group
+
+_mhc_fused_allreduce = get_mhc_fused_allreduce()
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if _mhc_fused_allreduce.maybe_skip_all_reduce(input_):
+        # the producer pushed this partial to every peer; the fused mHC post
+        # kernel of this layer sums it (see mhc_fused_allreduce.py)
+        return input_
     return get_tp_group().all_reduce(input_)
 
 

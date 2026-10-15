@@ -8,8 +8,9 @@ import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -55,6 +56,7 @@ if current_platform.is_rocm():
         fused_recurrent_kda,
     )
 else:
+    from vllm.models.glm5next.nvidia.ops.kda_fused_decode import kda_fused_decode
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
@@ -122,6 +124,43 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
             self.tp_rank = tp_rank
             if param_tp_rank is not None:
                 param.tp_rank = param_tp_rank
+
+
+class _BlockDiagonalMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Two independent ``[out, in]`` projections applied to adjacent input slices,
+    merged into one ``[2*out, 2*in]`` block-diagonal GEMM.
+
+    Checkpoint shard ``i`` (``[out, in]``) lands in rows of output block ``i`` and
+    columns ``[i*in, (i+1)*in)``; the off-diagonal blocks are zero.
+    """
+
+    def __init__(self, input_size: int, output_sizes: list[int], **kwargs) -> None:
+        assert len(output_sizes) == 2
+        self.block_input_size = input_size
+        super().__init__(input_size * 2, output_sizes, **kwargs)
+
+    def _pad(self, loaded_weight: torch.Tensor, loaded_shard_id: int) -> torch.Tensor:
+        assert loaded_weight.shape[-1] == self.block_input_size
+        padded = torch.zeros(
+            (*loaded_weight.shape[:-1], 2 * self.block_input_size),
+            dtype=loaded_weight.dtype,
+            device=loaded_weight.device,
+        )
+        start = loaded_shard_id * self.block_input_size
+        padded[..., start : start + self.block_input_size] = loaded_weight
+        return padded
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
+        assert loaded_shard_id in (0, 1), "checkpoints store f_b and g_b separately"
+        super().weight_loader(
+            param, self._pad(loaded_weight, loaded_shard_id), loaded_shard_id
+        )
+
+    def weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None):
+        assert loaded_shard_id in (0, 1), "checkpoints store f_b and g_b separately"
+        super().weight_loader_v2(
+            param, self._pad(loaded_weight, loaded_shard_id), loaded_shard_id
+        )
 
 
 @torch.compile(
@@ -251,12 +290,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_qkvbfg_a",
         )
 
-        self.f_b_proj = ColumnParallelLinear(
+        # f_b and g_b read the adjacent f_a | g_a columns of the merged input
+        # projection, so they run as one block-diagonal GEMM over 2*head_dim.
+        self.fg_b_proj = _BlockDiagonalMergedColumnParallelLinear(
             self.head_dim,
-            projection_size,
+            [projection_size, projection_size],
             bias=False,
             quant_config=self.quant_config,
-            prefix=f"{prefix}.f_b_proj",
+            prefix=f"{prefix}.fg_b_proj",
         )
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
@@ -301,13 +342,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
 
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -456,6 +490,32 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        decode = self._fused_decode_inputs()
+        if decode is not None:
+            core_attn_out = torch.empty(
+                (num_tokens, self.local_projection_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            state_indices, conv_state, recurrent_state = decode
+            kda_fused_decode(
+                projected,
+                self._get_merged_conv_weight(),
+                conv_state,
+                state_indices,
+                self.fg_b_proj.weight,
+                self.A_log,
+                self.dt_bias,
+                recurrent_state,
+                self.o_norm.weight,
+                core_attn_out,
+                self.local_num_heads,
+                self.head_dim,
+                self.head_dim**-0.5,
+                self.o_norm.eps,
+                -5.0 if self.kda_lower_bound is None else self.kda_lower_bound,
+            )
+            return self.o_proj(core_attn_out)[0]
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -472,10 +532,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
+        # One GEMM over the adjacent f_a | g_a columns (block-diagonal weight).
+        fg = projected[:, -2 * self.head_dim :]
+        g1, g_proj_states = self.fg_b_proj(fg)[0].split(
+            self.local_projection_size, dim=-1
+        )
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
-
-        g_proj_states = self.g_b_proj(g_a)[0]
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
@@ -495,6 +557,72 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
+
+    def _get_merged_conv_weight(self) -> torch.Tensor:
+        # One merged short-conv over q|k|v instead of three separate calls. The
+        # 1D conv is independent per channel, so concatenating q/k/v along the
+        # channel dim and running a single causal_conv1d is bit-identical to
+        # three calls. Built once and cached (params are fixed after load).
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        return self._merged_conv_weight
+
+    def _fused_decode_inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """(state indices, conv state, recurrent state) when this step is a
+        plain decode the single-kernel KDA path covers; otherwise None.
+
+        Only FULL CUDA graphs (captured per uniform-decode batch) and eager
+        steps take it: a piecewise graph is replayed for other batch kinds of
+        the same size, so it must not bake in a decode-only branch."""
+        if not envs.VLLM_KDA_FUSED_DECODE or not current_platform.is_cuda():
+            return None
+        forward_context = get_forward_context()
+        if forward_context.cudagraph_runtime_mode not in (
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.NONE,
+        ):
+            return None
+        metadata = forward_context.attn_metadata
+        if not isinstance(metadata, dict):
+            return None
+        md = metadata.get(self.prefix)
+        if not isinstance(md, GDNAttentionMetadata):
+            return None
+        if (
+            md.num_prefills > 0
+            or md.num_decodes == 0
+            or md.num_actual_tokens != md.num_decodes
+            or (md.spec_sequence_masks is not None and md.num_spec_decodes > 0)
+            or md.non_spec_state_indices_tensor is None
+            or self.conv_size != 4
+            or self.q_conv1d.bias is not None
+            or self.fg_b_proj.weight.dtype != self.o_norm.weight.dtype
+        ):
+            return None
+        conv_state, recurrent_state = self.kv_cache
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        if (
+            conv_state.shape[-1] != 3
+            or recurrent_state.dtype != torch.float32
+            or recurrent_state.shape[1:]
+            != (self.local_num_heads, self.head_dim, self.head_dim)
+        ):
+            return None
+        return (
+            md.non_spec_state_indices_tensor[: md.num_decodes],
+            conv_state,
+            recurrent_state,
+        )
 
     @eager_break_during_capture
     def _forward(
@@ -547,22 +675,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if not self._conv_state_dim_first:
             conv_state = conv_state.transpose(-1, -2)
 
-        # One merged short-conv over q|k|v instead of three separate calls. The
-        # 1D conv is independent per channel, so concatenating q/k/v along the
-        # channel dim and running a single causal_conv1d is bit-identical to
-        # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
-        # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
+        # conv_state is already stored as the merged q|k|v state.
+        conv_weights = self._get_merged_conv_weight()
         conv_bias = self.q_conv1d.bias
 
         # Split projections / gating into spec (draft-verify) and non-spec token

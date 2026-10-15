@@ -260,13 +260,15 @@ def test_w8a8_block_fp8_fused_moe(
 
 
 @pytest.mark.parametrize("clamp_limit", [None, 10.0])
+@pytest.mark.parametrize("N", [256, 384])
 @torch.inference_mode()
 def test_w8a8_block_fp8_clamp_skips_fused_silu_quant(
-    clamp_limit, monkeypatch, workspace_init, disable_deepgemm_ue8m0
+    clamp_limit, N, monkeypatch, workspace_init, disable_deepgemm_ue8m0
 ):
-    """A SwiGLU clamp must bypass the fused SiLU+quant kernel, which cannot clamp."""
+    """A SwiGLU clamp must bypass the fused SiLU+quant kernel, which cannot clamp.
+    N=384 is not a power of two, which the fused clamp kernel cannot take."""
     torch.manual_seed(0)
-    M, N, K, E, topk = 16, 256, 512, 8, 2
+    M, K, E, topk = 16, 512, 8, 2
     block_size = [128, 128]
 
     a = torch.randn((M, K), dtype=torch.bfloat16) / 10
@@ -311,6 +313,69 @@ def test_w8a8_block_fp8_clamp_skips_fused_silu_quant(
     assert (fused_calls > 0) == (clamp_limit is None), (
         f"fused fast path ran {fused_calls} times with clamp_limit={clamp_limit}"
     )
+
+
+@pytest.mark.parametrize("M", [1, 5, 16])
+@pytest.mark.parametrize(("N", "K"), [(512, 2048), (768, 2048), (1024, 4096)])
+@torch.inference_mode()
+def test_w8a8_block_fp8_small_m_gemv(
+    M, N, K, monkeypatch, workspace_init, disable_deepgemm_ue8m0
+):
+    """Decode-size batches with K % 2048 == 0 take the split-K small-M path,
+    which quantizes the activation itself and must match the reference."""
+    torch.manual_seed(0)
+    E, topk = 8, 2
+    block_size = [128, 128]
+
+    a = torch.randn((M, K), dtype=torch.bfloat16) / 10
+    score = torch.randn((M, E), dtype=torch.bfloat16)
+    w1, w2, quant_config = make_test_quant_config(
+        E,
+        N,
+        K,
+        torch.bfloat16,
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=False,
+        block_shape=block_size,
+    )
+    m_fused_moe = modular_triton_fused_moe(make_dummy_moe_config(), quant_config)
+    topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
+
+    small_m_calls = 0
+    small_m_moe = triton_moe.small_m_moe
+
+    def counting_small_m_moe(*args, **kwargs):
+        nonlocal small_m_calls
+        small_m_calls += 1
+        return small_m_moe(*args, **kwargs)
+
+    monkeypatch.setattr(triton_moe, "small_m_moe", counting_small_m_moe)
+
+    with set_current_vllm_config(vllm_config):
+        ref_out = torch_w8a8_block_fp8_moe(
+            a,
+            w1,
+            w2,
+            quant_config.w1_scale,
+            quant_config.w2_scale,
+            topk_weights,
+            topk_ids,
+            block_size,
+        )
+        m_out = m_fused_moe.apply(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            global_num_experts=E,
+        )
+
+    assert small_m_calls == 1
+    torch.testing.assert_close(m_out, ref_out, atol=0.035, rtol=0.035)
 
 
 @pytest.mark.parametrize(("M", "N", "K"), [(83, 512, 512), (2048, 4608, 512)])

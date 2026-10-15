@@ -11,6 +11,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.op import exp
 from vllm.triton_utils import tl, triton
 
@@ -86,7 +87,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     COMPUTE_GATE: tl.constexpr,  # g holds raw logits; KDA gate computed in-kernel
     SAFE_GATE: tl.constexpr,  # bounded gate variant (only branch implemented)
     LOWER_BOUND: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i_nh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -305,6 +310,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         LOWER_BOUND=-5.0,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     o = o.squeeze(0)
     return o, final_state
@@ -539,6 +545,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out, initial_state
 

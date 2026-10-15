@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -811,6 +812,57 @@ def mhc_post_tilelang(
     return out
 
 
+def mhc_single_kernel_applies(
+    num_tokens: int,
+    hidden_size: int,
+    hc_mult: int,
+    norm_weight: torch.Tensor | None,
+) -> bool:
+    """Whether ``mhc_fused_post_pre_tilelang`` takes the single-kernel path."""
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_fused_post_pre_split_config,
+    )
+
+    return (
+        envs.VLLM_MHC_SINGLE_KERNEL
+        and num_tokens == 1
+        and norm_weight is not None
+        and mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
+        is not None
+    )
+
+
+_SINGLE_KERNEL_SCRATCH: dict[
+    tuple[torch.device, int, int, int], dict[str, torch.Tensor]
+] = {}
+
+
+def _single_kernel_scratch(
+    device: torch.device, hidden_size: int, n_splits: int, n_out: int
+) -> dict[str, torch.Tensor]:
+    """Per-device buffers of the single-kernel mHC path: split-k partials, the
+    self-resetting grid barrier and placeholders for the fused all-reduce."""
+    key = (device, hidden_size, n_splits, n_out)
+    scratch = _SINGLE_KERNEL_SCRATCH.get(key)
+    if scratch is None:
+        from vllm.model_executor.kernels.mhc.tilelang_kernels import LAMPORT_SENTINEL
+
+        scratch = dict(
+            yp=torch.empty((n_splits, 1, n_out), dtype=torch.float32, device=device),
+            rp=torch.empty((n_splits, 1), dtype=torch.float32, device=device),
+            bar=torch.zeros(3, dtype=torch.int32, device=device),
+            peer=torch.full(
+                (2, 1, hidden_size // 2),
+                LAMPORT_SENTINEL,
+                dtype=torch.int32,
+                device=device,
+            ),
+            seq=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+        _SINGLE_KERNEL_SCRATCH[key] = scratch
+    return scratch
+
+
 def mhc_fused_post_pre_tilelang(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -828,8 +880,15 @@ def mhc_fused_post_pre_tilelang(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    peer_x: torch.Tensor | None = None,
+    seq: torch.Tensor | None = None,
+    world: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run one MHC post block followed by the next MHC pre block.
+
+    With ``world > 0`` (and ``peer_x``/``seq``), ``x`` is this rank's unreduced
+    TP partial: the single-kernel path waits for all peers' partials of this
+    site and sums them (see ``mhc_fused_allreduce.py``).
 
     When ``norm_weight`` is provided, the layer_input_cur output is the
     RMSNorm'd activation (fused into the kernel); otherwise it is the
@@ -850,6 +909,7 @@ def mhc_fused_post_pre_tilelang(
         _MHC_POST_TILELANG_KERNEL,
         _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
         mhc_fused_post_pre_split_config,
+        mhc_single_post_pre_tilelang,
     )
 
     assert residual.dtype == torch.bfloat16
@@ -891,6 +951,9 @@ def mhc_fused_post_pre_tilelang(
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
+    assert world == 0 or (fused_config is not None and num_tokens == 1), (
+        "the fused all-reduce needs the single-kernel mHC path for this shape"
+    )
 
     post_mix_cur = torch.empty(
         num_tokens,
@@ -911,7 +974,47 @@ def mhc_fused_post_pre_tilelang(
         device=residual.device,
     )
 
-    if fused_config is not None:
+    single = mhc_single_kernel_applies(num_tokens, hidden_size, hc_mult, norm_weight)
+    if single:
+        assert fused_config is not None
+        residual_cur = torch.empty_like(residual_flat)
+        scratch = _single_kernel_scratch(
+            residual.device, hidden_size, fused_config[1], hc_mult3
+        )
+        mhc_single_post_pre_tilelang(
+            comb_res_mix_flat,
+            residual_flat,
+            post_layer_mix_flat,
+            x_flat,
+            fn.view(hc_mult3, hc_mult, hidden_size),
+            hc_scale,
+            hc_base,
+            norm_weight,
+            scratch["yp"],
+            scratch["rp"],
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            layer_input_cur,
+            scratch["bar"],
+            peer_x if world > 0 else scratch["peer"],
+            seq if world > 0 else scratch["seq"],
+            hc_mult,
+            hidden_size,
+            hc_mult3,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_eps,
+            n_thr=fused_config[2],
+            tile_n=fused_config[0],
+            split_k=fused_config[1],
+            world=world,
+        )
+    elif fused_config is not None:
+        assert world == 0, "the fused all-reduce needs the single-kernel mHC path"
         gemm_out_mul, gemm_out_sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
             comb_res_mix_flat,
             residual_flat,
@@ -999,6 +1102,9 @@ def _mhc_fused_post_pre_tilelang_fake(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    peer_x: torch.Tensor | None = None,
+    seq: torch.Tensor | None = None,
+    world: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

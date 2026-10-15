@@ -8,6 +8,12 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.small_m_softmax import (
+    MAX_TOKENS as SMALL_M_SOFTMAX_MAX_TOKENS,
+)
+from vllm.model_executor.kernels.small_m_softmax import (
+    small_m_softmax,
+)
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
@@ -577,6 +583,20 @@ def random_sample(
     return sample_with_exponential_noise(probs, q)
 
 
+def _softmax_f32(logits: torch.Tensor) -> torch.Tensor:
+    """Row softmax; torch's one-CTA-per-row kernel takes ~40 us on a single
+    150k-wide decode row, so tiny batches use the multi-block kernel."""
+    if (
+        logits.is_cuda
+        and logits.dim() == 2
+        and logits.shape[0] <= SMALL_M_SOFTMAX_MAX_TOKENS
+        and logits.stride(1) == 1
+    ):
+        logger.info_once("Using small-M multi-block softmax in the sampler")
+        return small_m_softmax(logits)
+    return logits.softmax(dim=-1, dtype=torch.float32)
+
+
 def flashinfer_sample(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -598,13 +618,13 @@ def flashinfer_sample(
     assert not (k is None and p is None)
     if k is None:
         # Top-p only.
-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        probs = _softmax_f32(logits)
         next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
             probs, p, deterministic=True
         )
     elif p is None:
         # Top-k only.
-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        probs = _softmax_f32(logits)
         next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
             probs, k, deterministic=True
         )

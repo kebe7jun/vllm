@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm import envs
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -30,6 +31,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.glm5next.nvidia.ops.indexer_prologue import (
+    MAX_TOKENS as INDEXER_PROLOGUE_MAX_TOKENS,
+)
+from vllm.models.glm5next.nvidia.ops.indexer_prologue import indexer_decode_prologue
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -330,6 +335,22 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
+    def _use_fused_prologue(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            envs.VLLM_INDEXER_FUSED_PROLOGUE
+            and current_platform.is_cuda()
+            and hidden_states.shape[0] <= INDEXER_PROLOGUE_MAX_TOKENS
+            and self.rope_dim == 0
+            and self.head_dim == 128
+            and self.head_dim % self.n_head == 0
+            and hidden_states.dtype == torch.bfloat16
+            and self.wk_weights_proj.weight.dtype == torch.bfloat16
+            and self.index_kpool_compress_gate.dtype == torch.bfloat16
+            and self.k_norm.weight is not None
+            and self.k_norm.bias is not None
+            and hidden_states.shape[1] & (hidden_states.shape[1] - 1) == 0
+        )
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -339,6 +360,34 @@ class Indexer(nn.Module):
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
         kw, _ = self.wk_weights_proj(hidden_states)
+        if self._use_fused_prologue(hidden_states):
+            # One launch for the head weights, k norm, Hadamard + FP8 q quant,
+            # weight scaling and kpool gate (same math, fp32 head weights).
+            q_fp8, q_scale, weights, k, gate_score = indexer_decode_prologue(
+                hidden_states,
+                q.view(q.shape[0], -1),
+                kw,
+                self.wk_weights_proj.weight[self.head_dim :],
+                self.index_kpool_compress_gate,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+                self.softmax_scale * self.n_head**-0.5,
+            )
+            if self.n_head < 32:
+                pad = 32 - self.n_head
+                q_fp8 = _pad_indexer_heads(q_fp8, pad)
+                weights = _pad_indexer_heads(weights, pad)
+            return self.indexer_op(
+                hidden_states,
+                q_fp8,
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=self.index_kpool_compress_ape,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
         k = kw[:, : self.head_dim]
         if self._wp_fp32 is None:
             self._wp_fp32 = (

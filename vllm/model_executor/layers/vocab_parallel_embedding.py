@@ -21,6 +21,10 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
 )
+from vllm.model_executor.kernels.small_m_wo_fp8_gemv import (
+    maybe_attach_fp8_copy,
+    wo_fp8_apply,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -64,6 +68,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if envs.VLLM_SMALL_M_WO_FP8 and current_platform.is_cuda():
+            maybe_attach_fp8_copy(layer)
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
@@ -79,6 +85,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        if envs.VLLM_SMALL_M_WO_FP8:
+            out = wo_fp8_apply(layer, x, bias)
+            if out is not None:
+                return out
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

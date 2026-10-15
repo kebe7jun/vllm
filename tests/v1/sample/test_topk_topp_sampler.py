@@ -205,6 +205,22 @@ def test_flashinfer_sampler_fallback_when_jit_cannot_target_gpu(monkeypatch):
         flashinfer_sampler_supported()
 
 
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton not available on this platform")
+def test_small_m_softmax_matches_torch_with_masked_blocks():
+    """The multi-block softmax that FlashInfer sampling uses for <= 16 rows must
+    match torch.softmax, also when whole blocks are -inf (grammar bitmasks)."""
+    from vllm.model_executor.kernels.small_m_softmax import small_m_softmax
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    logits = (torch.randn(3, 151_936) * 4).bfloat16()
+    logits[0, 4096:40_000] = float("-inf")
+    logits[1, :-5] = float("-inf")
+    out = small_m_softmax(logits)
+    ref = logits.softmax(dim=-1, dtype=torch.float32)
+    torch.testing.assert_close(out, ref, atol=1e-6, rtol=1e-4)
+
+
 # =============================================================================
 # Triton kernel tests
 # =============================================================================
