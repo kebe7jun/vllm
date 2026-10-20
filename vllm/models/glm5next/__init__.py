@@ -9,6 +9,9 @@ if current_platform.is_xpu():
 from .common.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
 from .common.mtp import Glm5NextMTP
 
+if current_platform.is_cuda():
+    from .nvidia.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
+
 __all__ = [
     "Glm5NextForCausalLM",
     "Glm5NextForConditionalGeneration",

@@ -1,0 +1,46 @@
+{
+  "vllm/distributed/device_communicators/mhc_fused_allreduce.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/fused_allreduce.py",
+    "payload_sha256": "1bd94e4ef1a45aa0ac9c920cb86deb9c9b8ef334b42222816239e074f30104b4"
+  },
+  "vllm/model_executor/kernels/small_m_wo_fp8_gemv.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/wo_fp8_gemv.py",
+    "payload_sha256": "2f9e1314e304549541c71b9d79feee8251efde76f49216f58756cdecab593b01"
+  },
+  "vllm/model_executor/layers/fused_moe/small_m_moe.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/small_m_moe.py",
+    "payload_sha256": "b8eaeda855c2dfb20ab7f1d2eaa1ece52c818b48990c39368f52bf4316fe3609"
+  },
+  "vllm/model_executor/layers/fused_moe/router/small_m_topk_sigmoid.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/topk_sigmoid.py",
+    "payload_sha256": "244e54e5b6c24272afe9d3c584c8143a5862bcabf663cd220244cd289e4eea09"
+  },
+  "vllm/models/glm5next/nvidia/ops/kda_fused_decode.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/kda_fused_decode.py",
+    "payload_sha256": "234b68b92ae0c53d253359b6c584856391dd5e6b85d149cab5b75c2bfe06b880"
+  },
+  "vllm/models/glm5next/nvidia/ops/indexer_prologue.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/indexer_prologue.py",
+    "payload_sha256": "f50f03b53dad2107723804420955a3f329826ff09b0641d9b00eeb46876bee8e"
+  },
+  "vllm/models/glm5next/nvidia/ops/kda_q4.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/kda_q4.py",
+    "payload_sha256": "6853aebb5753b87fbd225aeee5e6cdb5641d1d8ea8d9bdb754494be693d5c89c"
+  },
+  "vllm/models/glm5next/nvidia/ops/kda_q4_parallel_history.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/kda_q4_parallel_history.py",
+    "payload_sha256": "e209ecf0dd27bfbfd8a7b500248a0a30a7e4a87b7a032295271b23b81f7d8e30"
+  },
+  "vllm/models/glm5next/nvidia/ops/kda_q4_parallel_history_fused_norm.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/kda_q4_parallel_history_fused_norm.py",
+    "payload_sha256": "5bfe91c545aacdad724dfe7482ff3287e9beb59c5a234c1abe92eea8f7b66f32"
+  },
+  "vllm/models/glm5next/nvidia/ops/q4_integration.py": {
+    "new": "vllm/models/glm5next/nvidia/specialized_decode/ops/q4_integration.py",
+    "payload_sha256": "3ae5ee7dd8114bdbe39208a9b3d697b0269dfd96f3d482d7a4135f0e31d38d04"
+  },
+  "mhc_single": {
+    "function_ast_sha256": "53d7656fee9ff42a4e867e353abc40aec49572df3f15c196f1ef62672c9da526",
+    "identical": true
+  }
+}
