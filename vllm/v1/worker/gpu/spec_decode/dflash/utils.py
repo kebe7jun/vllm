@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
+import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
+from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -11,6 +16,55 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     maybe_share_target_embed,
 )
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
+
+
+logger = init_logger(__name__)
+
+
+def _maybe_restore_dflash2_bf16_linears(
+    draft_model: nn.Module, hf_config
+) -> list[tuple[str, tuple[int, ...]]]:
+    """Disable optional WO FP8 copies only on the DFlash2 inner linears."""
+    if os.getenv("VLLM_DFLASH2_BF16_LINEAR", "0") != "1" or (
+        "DFlash2DraftModel" not in (getattr(hf_config, "architectures", None) or ())
+    ):
+        return []
+    restored = []
+    for name, module in draft_model.model.named_modules():
+        if (
+            isinstance(module, LinearBase)
+            and getattr(module, "_wo_fp8_weight", None) is not None
+        ):
+            restored.append((name, tuple(module.weight.shape)))
+            del module._wo_fp8_weight
+            if hasattr(module, "_wo_fp8_scale"):
+                del module._wo_fp8_scale
+    return restored
+
+
+def _maybe_restore_dflash2_bf16_shared_head(
+    draft_model: nn.Module, target_lm_head: nn.Module | None, hf_config
+) -> tuple[int, ...] | None:
+    """Restore the shared target/draft head's BF16 math before graph capture."""
+    if (
+        os.getenv("VLLM_DFLASH2_BF16_SHARED_HEAD", "0") != "1"
+        or "DFlash2DraftModel" not in (getattr(hf_config, "architectures", None) or ())
+        or target_lm_head is None
+        or getattr(draft_model, "lm_head", None) is not target_lm_head
+    ):
+        return None
+    weight = getattr(target_lm_head, "weight", None)
+    if (
+        weight is None
+        or weight.dtype != torch.bfloat16
+        or getattr(target_lm_head, "_wo_fp8_weight", None) is None
+    ):
+        return None
+    shape = tuple(weight.shape)
+    del target_lm_head._wo_fp8_weight
+    if hasattr(target_lm_head, "_wo_fp8_scale"):
+        del target_lm_head._wo_fp8_scale
+    return shape
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -46,6 +100,16 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
+    restored = _maybe_restore_dflash2_bf16_linears(
+        dflash_model, draft_model_config.hf_config
+    )
+    if restored:
+        logger.info(
+            "DFlash2 BF16 linear experiment: disabled %d WO FP8 copies: %s",
+            len(restored),
+            restored,
+        )
+
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
@@ -71,5 +135,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
+
+    shared_head_shape = _maybe_restore_dflash2_bf16_shared_head(
+        dflash_model, target_lm_head, draft_model_config.hf_config
+    )
+    if shared_head_shape is not None:
+        logger.info(
+            "DFlash2 BF16 shared-head experiment: disabled shared target/draft "
+            "WO FP8 copy, weight shape=%s; target head math changed",
+            shared_head_shape,
+        )
 
     return dflash_model

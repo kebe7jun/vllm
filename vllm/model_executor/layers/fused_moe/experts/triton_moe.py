@@ -4,8 +4,13 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.distributed.device_communicators.mhc_fused_allreduce import (
+    get_mhc_fused_allreduce,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -26,6 +31,16 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.silu_mul_clamp_block_quant import (
+    silu_mul_clamp_block_quant,
+    silu_mul_clamp_block_quant_supported,
+)
+from vllm.model_executor.layers.fused_moe.small_m_moe import (
+    MAX_TOKENS as SMALL_M_MAX_TOKENS,
+)
+from vllm.model_executor.layers.fused_moe.small_m_moe import (
+    small_m_moe,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -60,6 +75,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+logger = init_logger(__name__)
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -105,6 +122,50 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         return mk.FusedMoEActivationFormat.Standard
 
     @property
+    def _small_m_fused_quant(self) -> bool:
+        # The small-M path quantizes the activation inside its first kernel;
+        # for larger batches apply() quantizes (same kernel as the prepare step).
+        return (
+            envs.VLLM_MOE_SMALL_M_GEMV
+            and self.quant_config.use_fp8_w8a8
+            and self.block_shape == [128, 128]
+            and not self.quantization_emulation
+            and self._lora_context is None
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        )
+
+    def _small_m_gemv_applies(
+        self,
+        hidden_states: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        w1: torch.Tensor,
+        activation: MoEActivation,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> bool:
+        """Whether apply() takes the small-M split-K GEMV path. A bf16 input is
+        only left unquantized when this holds; otherwise apply() quantizes it."""
+        if not (
+            envs.VLLM_MOE_SMALL_M_GEMV
+            and hidden_states.shape[0] <= SMALL_M_MAX_TOKENS
+            and self.quant_config.use_fp8_w8a8
+            and self.block_shape == [128, 128]
+            and activation == MoEActivation.SILU
+            and self.activation_config.alpha == 1.0
+            and self.activation_config.beta == 0.0
+            and self._lora_context is None
+            and expert_map is None
+            and not apply_router_weight_on_input
+            and not self.quantization_emulation
+            and w1.size(1) % 256 == 0
+            and hidden_states.size(-1) % 2048 == 0
+        ):
+            return False
+        if a1q_scale is not None:
+            return hidden_states.dtype == self.quant_dtype
+        return self._small_m_fused_quant and hidden_states.dtype == torch.bfloat16
+
+    @property
     def expects_unquantized_inputs(self) -> bool:
         # Defer activation quantization to apply() only when LoRA is active AND
         # tokens are dispatched across ranks (DP+EP all2all).
@@ -112,7 +173,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             self._lora_context is not None
             and self.quant_dtype is not None
             and self.moe_config.moe_parallel_config.use_all2all_kernels
-        )
+        ) or self._small_m_fused_quant
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -286,7 +347,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # (mirrors what the prepare step would have done, but after the
         # all-gather so the layout matches the gathered topk_ids / token map).
         lora_unquantized_hidden_states: torch.Tensor | None = None
-        if self.expects_unquantized_inputs:
+        small_m_gemv = self._small_m_gemv_applies(
+            hidden_states,
+            a1q_scale,
+            w1,
+            activation,
+            expert_map,
+            apply_router_weight_on_input,
+        )
+        if self.expects_unquantized_inputs and not small_m_gemv:
             assert a1q_scale is None
             lora_unquantized_hidden_states = hidden_states
             hidden_states, a1q_scale = moe_kernel_quantize_input(
@@ -304,6 +373,32 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        if small_m_gemv:
+            logger.info_once("Using small-M split-K grouped GEMV MoE path")
+            cfg = self.moe_config
+            reduces = (
+                cfg.tp_size > 1
+                and cfg.ep_size == 1
+                and not cfg.skip_final_all_reduce
+                and not cfg.is_sequence_parallel
+            )
+            push = get_mhc_fused_allreduce().producer_args(output) if reduces else None
+            small_m_moe(
+                output,
+                hidden_states,
+                a1q_scale,
+                w1,
+                self.w1_scale,
+                w2,
+                self.w2_scale,
+                topk_ids.contiguous(),
+                topk_weights.contiguous(),
+                self.activation_config.clamp_limit,
+                is_deep_gemm_e8m0_used(),
+                push=push,
+            )
+            return
 
         config = try_get_optimal_moe_config(
             w1.size(),
@@ -513,6 +608,26 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 intermediate_cache1.view(-1, N),
                 group_size=128,
                 quant_dtype=current_platform.fp8_dtype(),
+            )
+        elif (
+            envs.VLLM_MOE_FUSED_CLAMP_ACT_QUANT
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is not None
+            and self.quant_config.use_fp8_w8a8
+            and self.block_shape == [128, 128]
+            and lora_context is None
+            and self.activation_config.alpha == 1.0
+            and self.activation_config.beta == 0.0
+            and not self.quantization_emulation
+            and silu_mul_clamp_block_quant_supported(N // 2, 128)
+        ):
+            # Clamped SwiGLU + group quant in one launch (the CUDA fused kernel
+            # above has no clamp; the e8m0 scale rounding is handled in-kernel).
+            qintermediate_cache2, a2q_scale = silu_mul_clamp_block_quant(
+                intermediate_cache1.view(-1, N),
+                self.activation_config.clamp_limit,
+                group_size=128,
+                use_ue8m0=is_deep_gemm_e8m0_used(),
             )
         else:
             self.activation(

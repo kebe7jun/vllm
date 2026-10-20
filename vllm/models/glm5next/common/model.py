@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -15,6 +16,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+)
+from vllm.distributed.device_communicators.mhc_fused_allreduce import (
+    get_mhc_fused_allreduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -100,6 +104,8 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+_fused_ar = get_mhc_fused_allreduce()
+
 
 _MHC_TAU = 0.05
 """mHC routing temperature. A GLM-5.3-Flash trained value that neither the
@@ -266,9 +272,10 @@ class Glm5NextMoE(nn.Module):
         swiglu_limit = config.swiglu_limit
         self.is_fused_shared_expert_enabled = False
         if config.n_shared_experts is not None:
-            self.is_fused_shared_expert_enabled = resolve_layer_fused_shared_expert(
-                quant_config, prefix
-            ) and _fused_shared_experts_tuned(parallel_config)
+            self.is_fused_shared_expert_enabled = envs.VLLM_FUSE_SHARED_EXPERTS or (
+                resolve_layer_fused_shared_expert(quant_config, prefix)
+                and _fused_shared_experts_tuned(parallel_config)
+            )
         if config.n_shared_experts is None or self.is_fused_shared_expert_enabled:
             self.shared_experts = None
         else:
@@ -366,6 +373,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.num_experts = config.n_routed_experts
         self.is_mtp_layer = is_mtp_layer
+        self._aux_requires_reduced_ffn = False
         self.mhc = config.mhc
         is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
@@ -555,6 +563,9 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        if self.layer_idx == 0:
+            # fused TP all-reduce (decode, 1 token): one sequence bump per step
+            _fused_ar.begin_step(x.shape[0], self.hidden_size, x.device)
         if post is None:
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
@@ -578,6 +589,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                **_fused_ar.consumer_kwargs(x),
             )
 
         # Attention needs the full token sequence; mHC above ran on the SP
@@ -604,13 +616,24 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight.data,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            **_fused_ar.consumer_kwargs(x),
         )
 
-        # Fully Connected
-        if self._mlp_is_moe:
-            x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
-        else:
-            x = self.mlp(x)
+        # Fully Connected. The last layer's MLP output goes to the plain
+        # hc_post, which cannot consume a pushed partial: keep its all-reduce.
+        last = self.layer_idx == self.num_hidden_layers - 1
+        restore_fused_ar = self._aux_requires_reduced_ffn and not last
+        fused_ar_active = _fused_ar.active
+        if last or restore_fused_ar:
+            _fused_ar.active = False
+        try:
+            if self._mlp_is_moe:
+                x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+            else:
+                x = self.mlp(x)
+        finally:
+            if restore_fused_ar:
+                _fused_ar.active = fused_ar_active
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -666,6 +689,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        **fused_ar: Any,
     ):
         return self.mhc_fused_post_pre_op(
             x=x,
@@ -684,6 +708,7 @@ class Glm5NextDecoderLayer(nn.Module):
             tile_n=1,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            **fused_ar,
         )
 
 
@@ -767,6 +792,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        for layer in self._active_layers:
+            # An aux tap completes this FFN before the next fused mHC consumer.
+            layer._aux_requires_reduced_ffn = (
+                layer.layer_idx + 1 in self.aux_hidden_state_layers
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -788,7 +821,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             return hidden_states
         assert residual is not None and comb is not None
         completed = self._aux_post_op(hidden_states, residual, post, comb)
-        return hc_contract(completed, self.config.mhc_num_residual_streams)
+        return hc_contract(completed, self.config.hc_mult)
 
     def forward(
         self,
@@ -874,6 +907,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             (".in_proj_qkvbfg_a", ".b_proj", 3),
             (".in_proj_qkvbfg_a", ".f_a_proj", 4),
             (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+            # KDA: f_b and g_b run as one block-diagonal GEMM
+            (".fg_b_proj", ".f_b_proj", 0),
+            (".fg_b_proj", ".g_b_proj", 1),
         ]
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales

@@ -351,6 +351,8 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # Programmatic dependent launch: let the next kernel's launch overlap this one.
+    launch_pdl: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -380,6 +382,9 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -903,6 +908,7 @@ def invoke_fused_moe_triton_kernel(
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
+        launch_pdl=current_platform.is_arch_support_pdl(),
         USE_TD=use_td,
         **config,
     )
@@ -1538,6 +1544,23 @@ direct_register_custom_op(
 )
 
 
+_NUM_TOKENS_POST_PADDED_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _constant_num_tokens_post_padded(value: int, device: torch.device) -> torch.Tensor:
+    """A cached ``[1]`` int32 tensor holding ``value``.
+
+    The low-latency path passes a constant here; allocating and filling it on
+    every call costs a kernel launch (and a CUDA-graph node) per MoE layer.
+    """
+    key = (device, value)
+    buf = _NUM_TOKENS_POST_PADDED_CACHE.get(key)
+    if buf is None:
+        buf = torch.full((1,), value, dtype=torch.int32, device=device)
+        _NUM_TOKENS_POST_PADDED_CACHE[key] = buf
+    return buf
+
+
 def _prepare_expert_assignment(
     topk_ids: torch.Tensor,
     config: dict[str, Any],
@@ -1570,11 +1593,8 @@ def _prepare_expert_assignment(
         return (
             None,
             topk_ids.view(-1),
-            torch.full(
-                (1,),
-                topk_ids.numel() * config["BLOCK_SIZE_M"],
-                dtype=torch.int32,
-                device=topk_ids.device,
+            _constant_num_tokens_post_padded(
+                topk_ids.numel() * config["BLOCK_SIZE_M"], topk_ids.device
             ),
         )
 

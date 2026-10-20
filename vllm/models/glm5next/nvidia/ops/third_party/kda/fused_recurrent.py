@@ -11,6 +11,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.op import exp
 from vllm.triton_utils import tl, triton
 
@@ -69,11 +70,12 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
-    # Token strides of q/k/v/beta (elements), see `token_stride`.
+    # Token strides of q/k/v/beta/g (elements), see `token_stride`.
     stride_q_t,
     stride_k_t,
     stride_v_t,
     stride_beta_t,
+    stride_g_t,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
@@ -86,7 +88,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     COMPUTE_GATE: tl.constexpr,  # g holds raw logits; KDA gate computed in-kernel
     SAFE_GATE: tl.constexpr,  # bounded gate variant (only branch implemented)
     LOWER_BOUND: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i_nh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -119,7 +125,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     if not IS_KDA:
         p_g = g + bos * HV + i_hv
     else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
+        p_gk = g + bos * stride_g_t + i_hv * K + o_k
 
     # Per-head gate amplitude, hoisted out of the token loop (COMPUTE_GATE).
     if COMPUTE_GATE:
@@ -217,7 +223,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if not IS_KDA:
             p_g += HV
         else:
-            p_gk += HV * K
+            p_gk += stride_g_t
         p_beta += stride_beta_t
 
 
@@ -293,6 +299,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         stride_k_t=token_stride(k),
         stride_v_t=token_stride(v),
         stride_beta_t=token_stride(beta),
+        stride_g_t=token_stride(g),
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
@@ -305,6 +312,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         LOWER_BOUND=-5.0,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     o = o.squeeze(0)
     return o, final_state
@@ -539,6 +547,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out, initial_state
 

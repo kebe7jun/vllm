@@ -1331,10 +1331,22 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if isinstance(spec, KpoolTailSpec)
     }
+    draft_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if type(spec) is SlidingWindowSpec
+    }
+    if draft_specs and (
+        getattr(vllm_config.speculative_config, "method", None) != "dflash"
+        or vllm_config.parallel_config.pipeline_parallel_size != 1
+        or vllm_config.parallel_config.decode_context_parallel_size != 1
+        or vllm_config.parallel_config.prefill_context_parallel_size != 1
+    ):
+        return None
     attn_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        if not isinstance(spec, (MambaSpec, KpoolTailSpec)) and name not in draft_specs
     }
     if not mamba_specs or not all(
         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
@@ -1391,10 +1403,31 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
+    draft_groups: list[KVCacheGroupSpec] = []
+    if draft_specs:
+        if len(draft_specs) > len(mla_names):
+            return None
+        # FA3 accepts 16-token multiples. Keep the draft's manager pages small
+        # enough for its window, without virtual splitting of padded pages.
+        padded_draft: dict[str, KVCacheSpec] = {}
+        for name, spec in draft_specs.items():
+            block_size = min(spec.block_size, uniform_spec.block_size // 4)
+            if block_size < 16 or block_size % 16:
+                return None
+            draft_spec = replace(spec, block_size=block_size, page_size_padded=None)
+            if draft_spec.unpadded_page_size_bytes > mla_page:
+                return None
+            padded_draft[name] = replace(draft_spec, page_size_padded=mla_page)
+        draft_uniform = UniformTypeKVCacheSpecs.from_specs(padded_draft)
+        if draft_uniform is None:
+            return None
+        draft_groups.append(KVCacheGroupSpec(list(padded_draft), draft_uniform))
+
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + draft_groups
     )
 
 
@@ -1422,6 +1455,7 @@ def _glm5_next_tensor_layout(
     mamba_groups = [
         group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
     ]
+    draft_groups = _glm5_next_swa_groups(kv_cache_groups)
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
     for group in uniform_groups:
@@ -1430,6 +1464,8 @@ def _glm5_next_tensor_layout(
             attn_group = group
         elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
             tail_group = group
+        elif group not in draft_groups:
+            return None
     if attn_group is None or not mamba_groups:
         return None
     if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
@@ -1456,6 +1492,13 @@ def _glm5_next_tensor_layout(
     idx_page = idx_pages.pop()
     if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
         return None
+
+    for group in draft_groups:
+        draft_inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+        if len(group.layer_names) > len(mla_names) or any(
+            spec.page_size_bytes != mla_page for spec in draft_inner.values()
+        ):
+            return None
 
     tail_names: list[str] = []
     tail_page = 0
@@ -1484,6 +1527,18 @@ def _glm5_next_tensor_layout(
         tail_names,
         tail_page,
     )
+
+
+def _glm5_next_swa_groups(groups: list[KVCacheGroupSpec]) -> list[KVCacheGroupSpec]:
+    return [
+        group
+        for group in groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        and all(
+            type(spec) is SlidingWindowSpec
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
+    ]
 
 
 def unify_kv_cache_spec_page_size(
@@ -1859,6 +1914,13 @@ def get_kv_cache_config_from_groups(
                     UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
                 ).kv_cache_specs
                 add_tensor(tail_name, tail_specs[tail_name], offset)
+
+        for group in _glm5_next_swa_groups(kv_cache_groups):
+            draft_inner = cast(
+                UniformTypeKVCacheSpecs, group.kv_cache_spec
+            ).kv_cache_specs
+            for index, name in enumerate(group.layer_names):
+                add_tensor(name, draft_inner[name], index * mla_page * num_blocks)
 
         return KVCacheConfig(
             num_blocks=num_blocks,
@@ -2616,6 +2678,12 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
+        total_blocks += sum(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
+                vllm_config
+            )
+            for group in _glm5_next_swa_groups(kv_cache_groups)
+        )
         return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)

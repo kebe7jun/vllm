@@ -211,6 +211,16 @@ if TYPE_CHECKING:
         "relax",
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
+    VLLM_MOE_FUSED_CLAMP_ACT_QUANT: bool = True
+    VLLM_FUSE_SHARED_EXPERTS: bool = False
+    VLLM_MOE_SMALL_M_GEMV: bool = True
+    VLLM_MOE_SMALL_M_PDL: bool = True
+    VLLM_SMALL_M_WO_FP8: bool = False
+    VLLM_MHC_FUSED_ALLREDUCE: bool = False
+    VLLM_MHC_SINGLE_KERNEL: bool = False
+    VLLM_KDA_FUSED_DECODE: bool = False
+    VLLM_SMALL_M_GEMV_PREFETCH: bool = False
+    VLLM_INDEXER_FUSED_PROLOGUE: bool = False
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1634,6 +1644,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "relax",
         ],
     ),
+    # Fuse the clamped SwiGLU and the FP8 group quant of the Triton MoE path
+    # into one Triton kernel.
+    "VLLM_MOE_FUSED_CLAMP_ACT_QUANT": lambda: bool(
+        int(os.getenv("VLLM_MOE_FUSED_CLAMP_ACT_QUANT", "1"))
+    ),
+    # Run the shared expert as an extra routed expert (weight 1) inside the
+    # fused MoE kernel instead of a separate MLP; saves ~6 launches per layer
+    # at small batch.
+    "VLLM_FUSE_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_FUSE_SHARED_EXPERTS", "0"))
+    ),
+    # Split-K grouped GEMV path for FP8 block-quantized Triton MoE at <= 16
+    # tokens (fuses activation, quantization and the top-k sum).
+    "VLLM_MOE_SMALL_M_GEMV": lambda: bool(int(os.getenv("VLLM_MOE_SMALL_M_GEMV", "1"))),
+    # Opt-in: keep an FP8 (block-128) copy of each bf16 linear weight and use it
+    # for decode GEMVs (<= 16 rows). Halves weight bytes per token; prefill
+    # keeps bf16. Changes decode numerics (weight-only FP8).
+    "VLLM_SMALL_M_WO_FP8": lambda: bool(int(os.getenv("VLLM_SMALL_M_WO_FP8", "0"))),
+    # Opt-in: fold the TP all-reduce of single-token decode steps into the mHC
+    # post kernel (GLM-5.3-Flash); needs the FP8 decode GEMV path.
+    "VLLM_MHC_FUSED_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_MHC_FUSED_ALLREDUCE", "0"))
+    ),
+    # Opt-in: one kernel for the mHC post step + next pre-norm of single-token
+    # decode (grid barrier instead of a second launch).
+    "VLLM_MHC_SINGLE_KERNEL": lambda: bool(
+        int(os.getenv("VLLM_MHC_SINGLE_KERNEL", "0"))
+    ),
+    # Opt-in: one kernel per KDA layer for pure decode steps (f/g projection,
+    # short conv, recurrent update and gated RMSNorm), GLM-5.3-Flash.
+    "VLLM_KDA_FUSED_DECODE": lambda: bool(int(os.getenv("VLLM_KDA_FUSED_DECODE", "0"))),
+    # Opt-in: the M=1 FP8 decode GEMV loads its weight slice before the PDL
+    # wait so the load overlaps the previous kernel.
+    "VLLM_SMALL_M_GEMV_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_SMALL_M_GEMV_PREFETCH", "0"))
+    ),
+    # Opt-in: one kernel for the GLM-5.3-Flash sparse-indexer prologue of
+    # <= 16 tokens (head weights, k norm, q Hadamard + FP8 quant, kpool gate).
+    "VLLM_INDEXER_FUSED_PROLOGUE": lambda: bool(
+        int(os.getenv("VLLM_INDEXER_FUSED_PROLOGUE", "0"))
+    ),
+    # Launch the small-M MoE GEMV kernels with programmatic dependent launch.
+    "VLLM_MOE_SMALL_M_PDL": lambda: bool(int(os.getenv("VLLM_MOE_SMALL_M_PDL", "1"))),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))

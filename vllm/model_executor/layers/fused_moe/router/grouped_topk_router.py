@@ -9,6 +9,7 @@ from vllm import envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
@@ -22,8 +23,16 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.small_m_topk_sigmoid import (
+    MAX_TOKENS as SMALL_M_TOPK_MAX_TOKENS,
+)
+from vllm.model_executor.layers.fused_moe.router.small_m_topk_sigmoid import (
+    small_m_topk_sigmoid,
+)
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 def fused_grouped_topk(
@@ -244,6 +253,28 @@ class GroupedTopk(CustomOp):
             )
 
 
+def _grouped_topk_with_shared(
+    *args, num_fused_shared_experts: int = 0, global_num_experts: int = 0, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CUDA grouped_topk plus the fused shared-expert slots (ids right after
+    the routed experts, weight 1.0), which the CUDA op does not append."""
+    topk_weights, topk_ids = grouped_topk(*args, **kwargs)
+    if num_fused_shared_experts > 0:
+        m = topk_ids.shape[0]
+        shared_ids = torch.arange(
+            global_num_experts,
+            global_num_experts + num_fused_shared_experts,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(m, num_fused_shared_experts)
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+        topk_weights = torch.cat(
+            [topk_weights, torch.ones_like(shared_ids, dtype=topk_weights.dtype)],
+            dim=-1,
+        )
+    return topk_weights, topk_ids
+
+
 class GroupedTopKRouter(BaseRouter):
     """Router using grouped top-k routing (e.g., DeepSeekV2/V3)."""
 
@@ -334,7 +365,34 @@ class GroupedTopKRouter(BaseRouter):
                 num_fused_shared_experts=self.num_fused_shared_experts,
             )
         else:
-            grouped_topk_impl = grouped_topk
+            if (
+                self.num_expert_group <= 1
+                and self.topk_group <= 1
+                and self.scoring_func == "sigmoid"
+                and self.e_score_correction_bias is not None
+                and router_logits.shape[0] <= SMALL_M_TOPK_MAX_TOKENS
+                and router_logits.is_cuda
+                and indices_type in (None, torch.int32, torch.int64, torch.uint32)
+                and not (self.skip_padding and envs.VLLM_MOE_SKIP_PADDING)
+            ):
+                # single group == plain biased top-k: one launch for scores,
+                # top-k, renorm, scaling and the fused shared-expert slots
+                logger.info_once("Using small-M fused sigmoid top-k routing kernel")
+                return small_m_topk_sigmoid(
+                    router_logits,
+                    self.e_score_correction_bias.data,
+                    self.top_k,
+                    self.renormalize,
+                    self.routed_scaling_factor,
+                    self.num_fused_shared_experts,
+                    1.0,
+                    indices_type,
+                )
+            grouped_topk_impl = partial(
+                _grouped_topk_with_shared,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                global_num_experts=self.global_num_experts,
+            )
 
         topk_weights, topk_ids = grouped_topk_impl(
             hidden_states=hidden_states,

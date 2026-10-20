@@ -128,6 +128,7 @@ def fused_recurrent_kda_fwd(
         stride_k_t=token_stride(k),
         stride_v_t=token_stride(v),
         stride_beta_t=token_stride(beta),
+        stride_g_t=token_stride(g),
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
@@ -174,14 +175,14 @@ def fused_recurrent_kda(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    # q/k/v/beta are consumed in place with an explicit token stride, so
+    # q/k/v/g/beta are consumed in place with an explicit token stride, so
     # column slices of the fused projection buffer need no copy; layouts the
     # kernel cannot address fail loudly in `token_stride`.
     o, final_state = fused_recurrent_kda_fwd(
         q=q,
         k=k,
         v=v,
-        g=g.contiguous(),
+        g=g,
         beta=beta,
         scale=scale,
         initial_state=initial_state,
