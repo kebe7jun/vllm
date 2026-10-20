@@ -59,5 +59,22 @@ class Glm5NextForCausalLM(StockCausalLM):
 
 
 class Glm5NextForConditionalGeneration(StockConditionalGeneration):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.language_model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
     def get_model_state_cls(self):
         return self.language_model.get_model_state_cls()

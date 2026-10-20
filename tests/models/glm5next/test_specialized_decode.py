@@ -65,6 +65,18 @@ assert Glm5NextForConditionalGeneration.__module__ == (
     "vllm.models.glm5next.nvidia.model"
 )
 assert Glm5NextMTP is not None
+
+import torch
+class ForwardSpy(torch.nn.Module):
+    def forward(self, **kwargs):
+        return kwargs["inputs_embeds"]
+wrapper = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
+torch.nn.Module.__init__(wrapper)
+wrapper.language_model = ForwardSpy()
+sentinel = object()
+assert wrapper(input_ids=None, positions=None, inputs_embeds=sentinel) is sentinel
+assert wrapper(input_ids=None, positions=None, intermediate_tensors={"x": 1},
+               inputs_embeds=sentinel) is None
 """
         subprocess.run([sys.executable, "-c", code], check=True, timeout=90)
 

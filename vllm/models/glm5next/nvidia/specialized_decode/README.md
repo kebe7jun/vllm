@@ -4,9 +4,10 @@ This opt-in backend packages the measured GLM decode implementation under the
 model. Enable it with:
 
 ```bash
-vllm serve /gpfs/rd/models/GLM-5.3-Flash \
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /gpfs/rd/models/GLM-5.3-Flash \
   --tensor-parallel-size 8 --max-num-seqs 1 --max-model-len 8192 \
   --language-model-only --moe-backend triton --no-enable-prefix-caching \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,4]}' \
   --additional-config '{"decode_backend":"latency_specialized"}' \
   --speculative-config '{"method":"dflash","num_speculative_tokens":3,"model":"/home/jovyan/models/incoai/GLM-5.3-Flash-DFlash2","draft_sample_method":"greedy","rejection_sample_method":"standard","attention_backend":"FLASH_ATTN"}'
 ```
@@ -56,3 +57,7 @@ measured single-kernel implementation is model-owned.
 No claim of hardware portability, MTP/DSpark support, arbitrary batch sizes,
 code correctness or population accuracy equivalence follows from the c1
 validation. Performance claims require same-source, same-precision A/B results.
+
+The backend follows model-owned specialized-decode integration. It retains
+the existing multi-kernel layer execution; it is not a single persistent
+CUDA launch for the whole model. The packaging alone has no claimed speedup.
