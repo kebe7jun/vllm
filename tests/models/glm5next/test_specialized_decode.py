@@ -66,6 +66,35 @@ assert Glm5NextForConditionalGeneration.__module__ == (
 )
 assert Glm5NextMTP is not None
 
+from types import SimpleNamespace
+from vllm.models.glm5next.nvidia.specialized_decode.runtime.decode import (
+    SpecializedDecode,
+)
+from vllm.models.glm5next.nvidia.specialized_decode.runtime.contracts import (
+    CacheBinding,
+)
+executor = SpecializedDecode.__new__(SpecializedDecode)
+executor.binding = CacheBinding()
+executor.plan_calls = executor.stock_calls = 0
+executor.names = ("kda",)
+assert executor.plan(SimpleNamespace(shape=(4096,)), None) is None
+assert executor.plan(SimpleNamespace(shape=(4,)), None) is None
+
+from unittest.mock import patch
+import unittest
+from vllm.config import CUDAGraphMode
+import vllm.models.glm5next.nvidia.specialized_decode.runtime.decode as decode_module
+md = SimpleNamespace(num_prefills=0, num_decodes=0, num_spec_decodes=1,
+    num_spec_decode_tokens=4, num_actual_tokens=4,
+    spec_state_indices_tensor=SimpleNamespace(shape=(1,4)),
+    num_accepted_tokens=SimpleNamespace(shape=(1,)))
+ctx = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                      attn_metadata={"kda": md})
+with patch.object(decode_module, "is_forward_context_available", return_value=True):
+    with patch.object(decode_module, "get_forward_context", return_value=ctx):
+        with unittest.TestCase().assertRaisesRegex(RuntimeError, "no bound KV"):
+            executor.plan(SimpleNamespace(shape=(4,)), None)
+
 import torch
 class ForwardSpy(torch.nn.Module):
     def forward(self, **kwargs):

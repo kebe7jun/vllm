@@ -164,8 +164,6 @@ class SpecializedDecode:
 
     def plan(self, positions, intermediate_tensors):
         self.plan_calls += 1
-        if self.binding.identity is None:
-            raise RuntimeError("Specialized decode has no bound KV cache")
         if intermediate_tensors is not None or positions.shape[0] != 4:
             self.stock_calls += 1
             return None
@@ -185,6 +183,8 @@ class SpecializedDecode:
         if md is None:
             self.stock_calls += 1
             return None
+        if self.binding.identity is None:
+            raise RuntimeError("Specialized decode has no bound KV cache")
         if torch.cuda.is_current_stream_capturing():
             self.binding.captured = True
         return Step(md, self.binding.generation)
