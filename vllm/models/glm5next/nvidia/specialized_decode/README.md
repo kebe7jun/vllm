@@ -1,7 +1,18 @@
 # GLM-5.3-Flash specialized decode on H200
 
-This opt-in backend packages the measured GLM decode implementation under the
-model. Enable it with:
+This experimental opt-in backend packages the measured GLM decode stack under
+the model. Keep `auto` for the recommended inherited path: the packaging has
+not passed its throughput non-regression gate.
+
+On 2026-10-20, a same-load ABBA comparison on eight H200s measured 461.48 tok/s
+for the inherited path and 451.86 tok/s for this executor (18 formal requests
+each, -2.08%). Estimated cycle time was 6.0804 versus 6.0773 ms; acceptance
+length changed from 2.8067 to 2.7468. This does not establish a kernel slowdown,
+but fails the predefined 1% throughput gate. Both paths scored 63/64 GSM8K,
+with all 64 complete token outputs identical. This is a small quality screen,
+not a general accuracy guarantee. The experiment used commit `c3b22ba3a2`.
+
+To reproduce the experimental path:
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /gpfs/rd/models/GLM-5.3-Flash \
