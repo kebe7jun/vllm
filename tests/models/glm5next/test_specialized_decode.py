@@ -3,6 +3,7 @@
 """CPU contracts for the opt-in GLM H200 runtime; no CUDA initialization."""
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from dataclasses import replace
@@ -31,6 +32,41 @@ class DecodeContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.api = load_contracts()
+
+    def test_kernel_namespace_does_not_eagerly_import_model_classes(self):
+        entry = _PATH.parents[3] / "__init__.py"
+        spec = importlib.util.spec_from_file_location("glm53_entry_contracts", entry)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertIn("Glm5NextForCausalLM", module.__all__)
+        self.assertNotIn("Glm5NextForCausalLM", vars(module))
+        with self.assertRaises(AttributeError):
+            _ = module.missing_model
+
+    def test_fresh_process_kernel_imports_and_registry_exports(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("Actual CUDA dependency environment required")
+        code = """
+import vllm.distributed
+import vllm.model_executor.layers.linear
+from vllm.models.glm5next import (
+    Glm5NextForCausalLM, Glm5NextForConditionalGeneration, Glm5NextMTP,
+)
+from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+    mhc_single_post_pre_tilelang,
+)
+from vllm.models.glm5next.nvidia.specialized_decode.ops import mhc_single
+assert mhc_single_post_pre_tilelang is mhc_single.mhc_single_post_pre_tilelang
+assert Glm5NextForCausalLM.__module__ == "vllm.models.glm5next.nvidia.model"
+assert Glm5NextForConditionalGeneration.__module__ == (
+    "vllm.models.glm5next.nvidia.model"
+)
+assert Glm5NextMTP is not None
+"""
+        subprocess.run([sys.executable, "-c", code], check=True, timeout=90)
 
     def test_default_disabled_and_invalid_backend_fails(self):
         self.assertFalse(self.api.enabled({}))

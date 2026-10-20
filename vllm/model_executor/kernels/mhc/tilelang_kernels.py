@@ -17,6 +17,9 @@ from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
     kernel_launcher,
     make_tilelang_warmup_tensor,
 )
+from vllm.models.glm5next.nvidia.specialized_decode.ops.mhc_single import (
+    mhc_single_post_pre_tilelang as mhc_single_post_pre_tilelang,
+)
 from vllm.platforms import current_platform
 from vllm.tilelang_utils import T, tilelang, tilelang_jit
 from vllm.utils.math_utils import cdiv
